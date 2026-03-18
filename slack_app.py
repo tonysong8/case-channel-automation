@@ -10,6 +10,7 @@ import json
 import re
 from typing import Dict, Any, Optional, List
 from datetime import datetime
+import threading
 
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
@@ -38,12 +39,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 설정값
-CONFIG = {
+# 사용자별 이메일 설정을 저장하기 위한 메모리 저장소 (프로덕션에서는 데이터베이스 사용 권장)
+USER_EMAIL_SETTINGS = {}
+EMAIL_LOCK = threading.Lock()
+
+# 기본 설정값
+DEFAULT_CONFIG = {
     "external_user_email": os.getenv("EXTERNAL_USER_EMAIL", "zealias@gmail.com"),
     "high_priority_email": os.getenv("HIGH_PRIORITY_EMAIL", "tony.song@outlook.com"),
     "medium_priority_email": os.getenv("MEDIUM_PRIORITY_EMAIL", "demoeng+jennifer_hynes_11880@slack-corp.com"),
 }
+
+
+def get_user_email_config(user_id: str) -> Dict[str, str]:
+    """사용자별 이메일 설정 가져오기"""
+    with EMAIL_LOCK:
+        return USER_EMAIL_SETTINGS.get(user_id, DEFAULT_CONFIG.copy())
+
+
+def set_user_email_config(user_id: str, config: Dict[str, str]):
+    """사용자별 이메일 설정 저장"""
+    with EMAIL_LOCK:
+        USER_EMAIL_SETTINGS[user_id] = config
+
+
+def validate_email(email: str) -> bool:
+    """이메일 형식 검증"""
+    import re
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    return bool(re.match(pattern, email.strip()))
 
 
 class CaseChannelAutomator:
@@ -186,7 +210,7 @@ class CaseChannelAutomator:
             logger.error(f"Unexpected error inviting external user {email}: {str(e)}")
             return False
     
-    def execute_case_automation(self, case_name: str, priority: str, requester_id: str) -> Dict[str, Any]:
+    def execute_case_automation(self, case_name: str, priority: str, requester_id: str, custom_emails: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """케이스 자동화 실행"""
         logger.info(f"Executing case automation: {case_name}, priority: {priority}")
         
@@ -202,6 +226,12 @@ class CaseChannelAutomator:
             "errors": []
         }
         
+        # 사용자별 이메일 설정 가져오기
+        if custom_emails:
+            email_config = custom_emails
+        else:
+            email_config = get_user_email_config(requester_id)
+        
         # 1. 채널 생성
         channel_info = self.create_channel(case_name, priority)
         if not channel_info:
@@ -213,43 +243,71 @@ class CaseChannelAutomator:
         
         # 2. Priority에 따른 사용자 초대
         priority_email = (
-            CONFIG["high_priority_email"] if priority.lower() == "high" 
-            else CONFIG["medium_priority_email"]
+            email_config["high_priority_email"] if priority.lower() == "high" 
+            else email_config["medium_priority_email"]
         )
         
         # 2.1 Priority 사용자 초대
-        is_external = self.check_if_external_user(priority_email)
-        if is_external:
-            success = self.invite_external_user(channel_id, priority_email)
-            result["invitations"]["external"].append({
-                "email": priority_email,
-                "role": f"{priority.upper()} Priority User",
-                "success": success
-            })
-        else:
-            success = self.invite_internal_user(channel_id, priority_email)
-            result["invitations"]["internal"].append({
-                "email": priority_email,
-                "role": f"{priority.upper()} Priority User", 
-                "success": success
-            })
-        
-        if not success:
-            result["errors"].append(f"Failed to invite priority user: {priority_email}")
+        if priority_email and priority_email.strip():
+            is_external = self.check_if_external_user(priority_email)
+            if is_external:
+                success = self.invite_external_user(channel_id, priority_email)
+                result["invitations"]["external"].append({
+                    "email": priority_email,
+                    "role": f"{priority.upper()} Priority User",
+                    "success": success
+                })
+            else:
+                success = self.invite_internal_user(channel_id, priority_email)
+                result["invitations"]["internal"].append({
+                    "email": priority_email,
+                    "role": f"{priority.upper()} Priority User", 
+                    "success": success
+                })
+            
+            if not success:
+                result["errors"].append(f"Failed to invite priority user: {priority_email}")
         
         # 2.2 외부 사용자 초대
-        external_email = CONFIG["external_user_email"]
-        external_success = self.invite_external_user(channel_id, external_email)
-        result["invitations"]["external"].append({
-            "email": external_email,
-            "role": "External Staff",
-            "success": external_success
-        })
+        external_email = email_config["external_user_email"]
+        if external_email and external_email.strip():
+            external_success = self.invite_external_user(channel_id, external_email)
+            result["invitations"]["external"].append({
+                "email": external_email,
+                "role": "External Staff",
+                "success": external_success
+            })
+            
+            if not external_success:
+                result["errors"].append(f"Failed to invite external user: {external_email}")
         
-        if not external_success:
-            result["errors"].append(f"Failed to invite external user: {external_email}")
+        # 3. 추가 이메일들 초대 (custom_emails에 있는 경우)
+        if custom_emails and custom_emails.get("additional_emails"):
+            additional_emails = [email.strip() for email in custom_emails["additional_emails"].split(",") if email.strip()]
+            for email in additional_emails:
+                if validate_email(email):
+                    is_external = self.check_if_external_user(email)
+                    if is_external:
+                        success = self.invite_external_user(channel_id, email)
+                        result["invitations"]["external"].append({
+                            "email": email,
+                            "role": "Additional User",
+                            "success": success
+                        })
+                    else:
+                        success = self.invite_internal_user(channel_id, email)
+                        result["invitations"]["internal"].append({
+                            "email": email,
+                            "role": "Additional User",
+                            "success": success
+                        })
+                    
+                    if not success:
+                        result["errors"].append(f"Failed to invite additional user: {email}")
+                else:
+                    result["errors"].append(f"Invalid email format: {email}")
         
-        # 3. 요청자를 채널에 초대 (아직 채널에 없는 경우)
+        # 4. 요청자를 채널에 초대 (아직 채널에 없는 경우)
         try:
             self.client.conversations_invite(channel=channel_id, users=requester_id)
         except SlackApiError as e:
@@ -275,6 +333,7 @@ def handle_app_home_opened(event, client):
     """App Home 탭이 열릴 때"""
     try:
         user_id = event["user"]
+        user_config = get_user_email_config(user_id)
         
         # App Home 뷰 구성
         blocks = [
@@ -289,7 +348,7 @@ def handle_app_home_opened(event, client):
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": "*자동으로 케이스 채널을 생성하고 적절한 사용자들을 초대합니다.*\n\n• High Priority 케이스 → `tony.song@outlook.com` 초대\n• Medium Priority 케이스 → `demoeng+jennifer_hynes_11880@slack-corp.com` 초대\n• 모든 케이스 → `zealias@gmail.com` 외부 사용자 초대 (Slack Connect)"
+                    "text": "*자동으로 케이스 채널을 생성하고 적절한 사용자들을 초대합니다.*"
                 }
             },
             {
@@ -299,7 +358,52 @@ def handle_app_home_opened(event, client):
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": "*사용법:*\n`/case-invite case-name priority`\n\n*예시:*\n• `/case-invite urgent-bug-fix high`\n• `/case-invite feature-request medium`"
+                    "text": "*현재 이메일 설정:*"
+                }
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*High Priority:*\n`{user_config.get('high_priority_email', '설정되지 않음')}`"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*Medium Priority:*\n`{user_config.get('medium_priority_email', '설정되지 않음')}`"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*외부 사용자:*\n`{user_config.get('external_user_email', '설정되지 않음')}`"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": " "
+                    }
+                ]
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "⚙️ 이메일 설정"
+                        },
+                        "style": "primary",
+                        "action_id": "configure_emails"
+                    }
+                ]
+            },
+            {
+                "type": "divider"
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*케이스 생성:*"
                 }
             },
             {
@@ -309,7 +413,7 @@ def handle_app_home_opened(event, client):
                         "type": "button",
                         "text": {
                             "type": "plain_text",
-                            "text": "🚨 High Priority 케이스 생성"
+                            "text": "🚨 High Priority 케이스"
                         },
                         "style": "danger",
                         "action_id": "create_high_priority_case",
@@ -319,13 +423,36 @@ def handle_app_home_opened(event, client):
                         "type": "button", 
                         "text": {
                             "type": "plain_text",
-                            "text": "📋 Medium Priority 케이스 생성"
+                            "text": "📋 Medium Priority 케이스"
                         },
                         "style": "primary",
                         "action_id": "create_medium_priority_case",
                         "value": "medium"
                     }
                 ]
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button", 
+                        "text": {
+                            "type": "plain_text",
+                            "text": "🎯 커스텀 케이스 생성"
+                        },
+                        "action_id": "create_custom_case"
+                    }
+                ]
+            },
+            {
+                "type": "divider"
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*사용법:*\n• 위 버튼을 클릭하여 케이스 생성\n• `/case-invite case-name priority` 명령어 사용\n• `case-` 접두사로 채널을 생성하면 자동 처리"
+                }
             }
         ]
         
@@ -472,6 +599,426 @@ def handle_case_invite_command(ack, respond, command):
 # Interactive Components
 # ============================
 
+@app.action("configure_emails")
+def handle_configure_emails(ack, body, client):
+    """이메일 설정 버튼"""
+    ack()
+    
+    try:
+        user_id = body["user"]["id"]
+        user_config = get_user_email_config(user_id)
+        
+        # 이메일 설정 모달 열기
+        client.views_open(
+            trigger_id=body["trigger_id"],
+            view={
+                "type": "modal",
+                "callback_id": "email_settings_modal",
+                "title": {
+                    "type": "plain_text",
+                    "text": "⚙️ 이메일 설정"
+                },
+                "submit": {
+                    "type": "plain_text", 
+                    "text": "저장"
+                },
+                "close": {
+                    "type": "plain_text",
+                    "text": "취소"
+                },
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "*케이스 생성시 초대할 사용자 이메일을 설정하세요.*"
+                        }
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "high_priority_email_block",
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "high_priority_email_input",
+                            "placeholder": {
+                                "type": "plain_text",
+                                "text": "high priority 케이스에 초대할 이메일"
+                            },
+                            "initial_value": user_config.get("high_priority_email", "")
+                        },
+                        "label": {
+                            "type": "plain_text",
+                            "text": "High Priority 사용자 이메일"
+                        }
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "medium_priority_email_block",
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "medium_priority_email_input",
+                            "placeholder": {
+                                "type": "plain_text",
+                                "text": "medium priority 케이스에 초대할 이메일"
+                            },
+                            "initial_value": user_config.get("medium_priority_email", "")
+                        },
+                        "label": {
+                            "type": "plain_text",
+                            "text": "Medium Priority 사용자 이메일"
+                        }
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "external_user_email_block",
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "external_user_email_input",
+                            "placeholder": {
+                                "type": "plain_text",
+                                "text": "외부 사용자 이메일 (Slack Connect)"
+                            },
+                            "initial_value": user_config.get("external_user_email", "")
+                        },
+                        "label": {
+                            "type": "plain_text",
+                            "text": "외부 사용자 이메일"
+                        }
+                    },
+                    {
+                        "type": "context",
+                        "elements": [
+                            {
+                                "type": "mrkdwn",
+                                "text": "💡 외부 사용자는 Slack Connect를 통해 자동 초대됩니다. 빈 칸으로 두면 해당 사용자는 초대하지 않습니다."
+                            }
+                        ]
+                    }
+                ]
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error opening email settings modal: {str(e)}")
+
+
+@app.view("email_settings_modal")
+def handle_email_settings_modal_submission(ack, body, client, view):
+    """이메일 설정 모달 제출"""
+    ack()
+    
+    try:
+        user_id = body["user"]["id"]
+        
+        # 입력값 추출
+        values = view["state"]["values"]
+        high_priority_email = values["high_priority_email_block"]["high_priority_email_input"]["value"] or ""
+        medium_priority_email = values["medium_priority_email_block"]["medium_priority_email_input"]["value"] or ""
+        external_user_email = values["external_user_email_block"]["external_user_email_input"]["value"] or ""
+        
+        # 이메일 검증
+        errors = {}
+        
+        if high_priority_email.strip() and not validate_email(high_priority_email):
+            errors["high_priority_email_block"] = "올바른 이메일 형식을 입력해주세요."
+        
+        if medium_priority_email.strip() and not validate_email(medium_priority_email):
+            errors["medium_priority_email_block"] = "올바른 이메일 형식을 입력해주세요."
+            
+        if external_user_email.strip() and not validate_email(external_user_email):
+            errors["external_user_email_block"] = "올바른 이메일 형식을 입력해주세요."
+        
+        if errors:
+            ack({
+                "response_action": "errors",
+                "errors": errors
+            })
+            return
+        
+        # 설정 저장
+        user_config = {
+            "high_priority_email": high_priority_email.strip(),
+            "medium_priority_email": medium_priority_email.strip(),
+            "external_user_email": external_user_email.strip()
+        }
+        set_user_email_config(user_id, user_config)
+        
+        # 성공 메시지 전송
+        try:
+            client.chat_postMessage(
+                channel=user_id,
+                text="✅ 이메일 설정이 저장되었습니다!",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "✅ *이메일 설정이 저장되었습니다!*"
+                        }
+                    },
+                    {
+                        "type": "section",
+                        "fields": [
+                            {
+                                "type": "mrkdwn",
+                                "text": f"*High Priority:*\n`{high_priority_email or '없음'}`"
+                            },
+                            {
+                                "type": "mrkdwn",
+                                "text": f"*Medium Priority:*\n`{medium_priority_email or '없음'}`"
+                            },
+                            {
+                                "type": "mrkdwn",
+                                "text": f"*외부 사용자:*\n`{external_user_email or '없음'}`"
+                            },
+                            {
+                                "type": "mrkdwn",
+                                "text": " "
+                            }
+                        ]
+                    }
+                ]
+            )
+        except SlackApiError as e:
+            logger.error(f"Failed to send confirmation message: {e.response['error']}")
+        
+        # App Home 업데이트 (이벤트 재발생시킴)
+        try:
+            client.views_publish(user_id=user_id, view={"type": "home", "blocks": []})
+        except:
+            pass
+        
+    except Exception as e:
+        logger.error(f"Error handling email settings modal submission: {str(e)}")
+
+
+@app.action("create_custom_case")
+def handle_create_custom_case(ack, body, client):
+    """커스텀 케이스 생성 버튼"""
+    ack()
+    
+    try:
+        user_id = body["user"]["id"]
+        
+        # 커스텀 케이스 생성 모달 열기
+        client.views_open(
+            trigger_id=body["trigger_id"],
+            view={
+                "type": "modal",
+                "callback_id": "custom_case_modal",
+                "title": {
+                    "type": "plain_text",
+                    "text": "🎯 커스텀 케이스 생성"
+                },
+                "submit": {
+                    "type": "plain_text", 
+                    "text": "생성"
+                },
+                "close": {
+                    "type": "plain_text",
+                    "text": "취소"
+                },
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "case_name_block",
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "case_name_input",
+                            "placeholder": {
+                                "type": "plain_text",
+                                "text": "예: custom-integration-bug"
+                            }
+                        },
+                        "label": {
+                            "type": "plain_text",
+                            "text": "케이스 이름"
+                        }
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "priority_block",
+                        "element": {
+                            "type": "static_select",
+                            "action_id": "priority_select",
+                            "placeholder": {
+                                "type": "plain_text",
+                                "text": "우선순위 선택"
+                            },
+                            "options": [
+                                {
+                                    "text": {
+                                        "type": "plain_text",
+                                        "text": "🚨 High Priority"
+                                    },
+                                    "value": "high"
+                                },
+                                {
+                                    "text": {
+                                        "type": "plain_text",
+                                        "text": "📋 Medium Priority"
+                                    },
+                                    "value": "medium"
+                                }
+                            ]
+                        },
+                        "label": {
+                            "type": "plain_text",
+                            "text": "우선순위"
+                        }
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "priority_email_block",
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "priority_email_input",
+                            "placeholder": {
+                                "type": "plain_text",
+                                "text": "우선순위에 따라 초대할 이메일 (선택사항)"
+                            }
+                        },
+                        "label": {
+                            "type": "plain_text",
+                            "text": "Priority 사용자 이메일"
+                        },
+                        "optional": True
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "external_email_block",
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "external_email_input",
+                            "placeholder": {
+                                "type": "plain_text",
+                                "text": "외부 사용자 이메일 (선택사항)"
+                            }
+                        },
+                        "label": {
+                            "type": "plain_text",
+                            "text": "외부 사용자 이메일"
+                        },
+                        "optional": True
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "additional_emails_block",
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "additional_emails_input",
+                            "placeholder": {
+                                "type": "plain_text",
+                                "text": "user1@example.com, user2@example.com"
+                            },
+                            "multiline": True
+                        },
+                        "label": {
+                            "type": "plain_text",
+                            "text": "추가 이메일들 (쉼표로 구분)"
+                        },
+                        "optional": True
+                    },
+                    {
+                        "type": "context",
+                        "elements": [
+                            {
+                                "type": "mrkdwn",
+                                "text": "💡 빈 칸으로 두면 개인 설정값을 사용합니다. 외부 사용자는 Slack Connect로 자동 초대됩니다."
+                            }
+                        ]
+                    }
+                ]
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error opening custom case modal: {str(e)}")
+
+
+@app.view("custom_case_modal")
+def handle_custom_case_modal_submission(ack, body, client, view):
+    """커스텀 케이스 모달 제출"""
+    ack()
+    
+    try:
+        user_id = body["user"]["id"]
+        values = view["state"]["values"]
+        
+        # 입력값 추출
+        case_name = values["case_name_block"]["case_name_input"]["value"]
+        priority = values["priority_block"]["priority_select"]["selected_option"]["value"]
+        priority_email = values.get("priority_email_block", {}).get("priority_email_input", {}).get("value", "").strip()
+        external_email = values.get("external_email_block", {}).get("external_email_input", {}).get("value", "").strip()
+        additional_emails = values.get("additional_emails_block", {}).get("additional_emails_input", {}).get("value", "").strip()
+        
+        # 입력값 검증
+        errors = {}
+        
+        if not case_name or not case_name.strip():
+            errors["case_name_block"] = "케이스 이름을 입력해주세요."
+        
+        if priority_email and not validate_email(priority_email):
+            errors["priority_email_block"] = "올바른 이메일 형식을 입력해주세요."
+            
+        if external_email and not validate_email(external_email):
+            errors["external_email_block"] = "올바른 이메일 형식을 입력해주세요."
+        
+        # 추가 이메일 검증
+        if additional_emails:
+            email_list = [email.strip() for email in additional_emails.split(",") if email.strip()]
+            for email in email_list:
+                if not validate_email(email):
+                    errors["additional_emails_block"] = f"올바르지 않은 이메일 형식: {email}"
+                    break
+        
+        if errors:
+            ack({
+                "response_action": "errors",
+                "errors": errors
+            })
+            return
+        
+        case_name = case_name.strip()
+        
+        # 커스텀 이메일 설정 구성
+        user_config = get_user_email_config(user_id)
+        custom_emails = {
+            "high_priority_email": priority_email if priority_email else user_config.get("high_priority_email", ""),
+            "medium_priority_email": priority_email if priority_email else user_config.get("medium_priority_email", ""),
+            "external_user_email": external_email if external_email else user_config.get("external_user_email", ""),
+            "additional_emails": additional_emails
+        }
+        
+        # 자동화 실행
+        result = automator.execute_case_automation(case_name, priority, user_id, custom_emails)
+        
+        # 결과를 사용자에게 DM으로 전송
+        blocks = create_result_blocks(result)
+        
+        try:
+            client.chat_postMessage(
+                channel=user_id,
+                text=f"커스텀 케이스 자동화 {'완료' if result['success'] else '실패'}",
+                blocks=blocks
+            )
+        except SlackApiError as e:
+            logger.error(f"Failed to send DM to user: {e.response['error']}")
+        
+        # 생성된 채널에도 메시지 전송
+        if result.get("channel"):
+            channel_id = result["channel"]["id"]
+            try:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"케이스 채널 자동화 {'완료' if result['success'] else '실패'}",
+                    blocks=blocks
+                )
+            except SlackApiError as e:
+                logger.error(f"Failed to post to channel: {e.response['error']}")
+        
+    except Exception as e:
+        logger.error(f"Error handling custom case modal submission: {str(e)}")
+
+
 @app.action("create_high_priority_case")
 def handle_high_priority_case(ack, body, client):
     """High Priority 케이스 생성 버튼"""
@@ -479,6 +1026,7 @@ def handle_high_priority_case(ack, body, client):
     
     try:
         user_id = body["user"]["id"]
+        user_config = get_user_email_config(user_id)
         
         # 모달 열기
         client.views_open(
@@ -520,8 +1068,17 @@ def handle_high_priority_case(ack, body, client):
                         "type": "section",
                         "text": {
                             "type": "mrkdwn",
-                            "text": "*High Priority 케이스 설정:*\n• Priority 사용자: `tony.song@outlook.com`\n• 외부 사용자: `zealias@gmail.com` (Slack Connect)\n• 채널은 공개로 생성됩니다"
+                            "text": f"*High Priority 케이스 설정:*\n• Priority 사용자: `{user_config.get('high_priority_email', '설정되지 않음')}`\n• 외부 사용자: `{user_config.get('external_user_email', '설정되지 않음')}`\n• 채널은 공개로 생성됩니다"
                         }
+                    },
+                    {
+                        "type": "context",
+                        "elements": [
+                            {
+                                "type": "mrkdwn",
+                                "text": "💡 이메일 설정을 변경하려면 홈 탭의 '⚙️ 이메일 설정' 버튼을 사용하세요."
+                            }
+                        ]
                     }
                 ]
             }
@@ -537,6 +1094,7 @@ def handle_medium_priority_case(ack, body, client):
     
     try:
         user_id = body["user"]["id"]
+        user_config = get_user_email_config(user_id)
         
         # 모달 열기
         client.views_open(
@@ -578,8 +1136,17 @@ def handle_medium_priority_case(ack, body, client):
                         "type": "section",
                         "text": {
                             "type": "mrkdwn",
-                            "text": "*Medium Priority 케이스 설정:*\n• Priority 사용자: `demoeng+jennifer_hynes_11880@slack-corp.com`\n• 외부 사용자: `zealias@gmail.com` (Slack Connect)\n• 채널은 공개로 생성됩니다"
+                            "text": f"*Medium Priority 케이스 설정:*\n• Priority 사용자: `{user_config.get('medium_priority_email', '설정되지 않음')}`\n• 외부 사용자: `{user_config.get('external_user_email', '설정되지 않음')}`\n• 채널은 공개로 생성됩니다"
                         }
+                    },
+                    {
+                        "type": "context",
+                        "elements": [
+                            {
+                                "type": "mrkdwn",
+                                "text": "💡 이메일 설정을 변경하려면 홈 탭의 '⚙️ 이메일 설정' 버튼을 사용하세요."
+                            }
+                        ]
                     }
                 ]
             }
@@ -590,7 +1157,7 @@ def handle_medium_priority_case(ack, body, client):
 
 @app.view("case_creation_modal")
 def handle_case_creation_modal_submission(ack, body, client, view):
-    """케이스 생성 모달 제출"""
+    """케이스 생성 모달 제출 (High/Medium Priority)"""
     ack()
     
     try:
@@ -612,7 +1179,7 @@ def handle_case_creation_modal_submission(ack, body, client, view):
         
         case_name = case_name.strip()
         
-        # 자동화 실행
+        # 자동화 실행 (사용자 설정 이메일 사용)
         result = automator.execute_case_automation(case_name, priority, user_id)
         
         # 결과를 사용자에게 DM으로 전송
@@ -763,6 +1330,23 @@ def create_result_blocks(result: Dict[str, Any]) -> List[Dict[str, Any]]:
                     }
                 ]
             })
+    
+    # 초대 통계 추가
+    total_internal = len(internal_invites)
+    total_external = len(external_invites)
+    successful_internal = sum(1 for invite in internal_invites if invite["success"])
+    successful_external = sum(1 for invite in external_invites if invite["success"])
+    
+    if total_internal > 0 or total_external > 0:
+        blocks.append({
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"📊 초대 결과: 내부 {successful_internal}/{total_internal}, 외부 {successful_external}/{total_external}"
+                }
+            ]
+        })
     
     # 오류 정보
     if result.get("errors"):
