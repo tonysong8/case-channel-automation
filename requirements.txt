@@ -1,0 +1,7 @@
+flask>=2.3.0
+slack-bolt>=1.18.0
+slack-sdk>=3.27.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+gunicorn>=21.2.0
+PyYAML>=6.0.0

@@ -1,0 +1,60 @@
+{
+  "display_information": {
+    "name": "Case Channel Automator",
+    "description": "Priority에 따라 채널 생성 및 외부 사용자 자동 초대",
+    "background_color": "#2c3e50",
+    "long_description": "케이스가 생성될 때마다 자동으로 채널을 만들고, Priority에 따라 적절한 사용자들을 초대하는 Slack App입니다. 외부 조직 사용자는 Slack Connect를 통해 자동으로 초대됩니다."
+  },
+  "features": {
+    "app_home": {
+      "home_tab_enabled": true,
+      "messages_tab_enabled": false
+    },
+    "bot_user": {
+      "display_name": "Case Automator",
+      "always_online": true
+    },
+    "slash_commands": [
+      {
+        "command": "/case-invite",
+        "url": "https://your-domain.com/slack/commands/case-invite",
+        "description": "케이스 채널을 생성하고 사용자들을 초대합니다",
+        "usage_hint": "case-name priority(high/medium)",
+        "should_escape": false
+      }
+    ]
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "channels:write",
+        "channels:manage",
+        "channels:read",
+        "chat:write",
+        "users:read",
+        "users:read.email",
+        "conversations.connect:write",
+        "conversations.connect:read",
+        "app_mentions:read",
+        "commands"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "request_url": "https://your-domain.com/slack/events",
+      "bot_events": [
+        "channel_created",
+        "member_joined_channel",
+        "app_home_opened"
+      ]
+    },
+    "interactivity": {
+      "is_enabled": true,
+      "request_url": "https://your-domain.com/slack/interactive"
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false
+  }
+}
